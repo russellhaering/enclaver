@@ -3,39 +3,32 @@ use bollard::container::{Config, LogOutput, LogsOptions, WaitContainerOptions};
 use bollard::models::{DeviceMapping, HostConfig, PortBinding, PortMap};
 use bollard::Docker;
 use futures_util::stream::{StreamExt, TryStreamExt};
+use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 pub struct RunWrapper {
     docker: Arc<Docker>,
-    container_id: Option<String>,
-    stream_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunWrapper {
     pub fn new() -> Result<Self> {
-        let docker_client = Arc::new(
+        let docker = Arc::new(
             Docker::connect_with_local_defaults()
                 .map_err(|e| anyhow!("connecting to docker: {}", e))?,
         );
 
         Ok(Self {
-            docker: docker_client,
-            container_id: None,
-            stream_task: None,
+            docker,
         })
     }
 
     pub async fn run_enclaver_image(
-        &mut self,
+        &self,
         image_name: &str,
         port_forwards: Vec<String>,
-    ) -> Result<()> {
-        if self.container_id.is_some() {
-            return Err(anyhow!("container already running"));
-        }
-
+    ) -> Result<RunHandle> {
         let port_re = regex::Regex::new(r"(\d+):(\d+)")?;
 
         let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
@@ -85,36 +78,20 @@ impl RunWrapper {
             .await?
             .id;
 
-        self.container_id = Some(container_id.clone());
-
         self.docker
             .start_container::<String>(&container_id, None)
             .await?;
 
-        self.start_output_stream_task(container_id.clone()).await?;
+        let stream_task = self.start_output_stream_task(container_id.clone()).await?;
 
-        let status_code = self
-            .docker
-            .wait_container(&container_id, None::<WaitContainerOptions<String>>)
-            .try_collect::<Vec<_>>()
-            .await?
-            .first()
-            .ok_or_else(|| anyhow!("missing wait response from daemon",))?
-            .status_code;
-
-        self.container_id = None;
-
-        if status_code != 0 {
-            return Err(anyhow!("non-zero exit code from container",));
-        }
-
-        // Remove the container after it successfully exits.
-        self.docker.remove_container(&container_id, None).await?;
-
-        Ok(())
+        Ok(RunHandle {
+            docker: self.docker.clone(),
+            container_id,
+            stream_task,
+        })
     }
 
-    async fn start_output_stream_task(&mut self, container_id: String) -> Result<()> {
+    async fn start_output_stream_task(&self, container_id: String) -> Result<tokio::task::JoinHandle<()>> {
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
 
@@ -128,7 +105,7 @@ impl RunWrapper {
             }),
         );
 
-        self.stream_task = Some(tokio::task::spawn(async move {
+        let jh = tokio::task::spawn(async move {
             while let Some(Ok(item)) = log_stream.next().await {
                 match item {
                     LogOutput::StdOut { message } => stdout.write_all(&message).await.unwrap(),
@@ -136,21 +113,55 @@ impl RunWrapper {
                     _ => {}
                 }
             }
-        }));
+        });
 
-        Ok(())
+        Ok(jh)
+    }
+}
+
+pub struct RunHandle {
+    container_id: String,
+    stream_task: tokio::task::JoinHandle<()>,
+    docker: Arc<Docker>,
+}
+
+impl RunHandle {
+    pub async fn wait(self, cancel: CancellationToken) -> Result<i64> {
+        let res = {
+            let inner_wait_future = self.inner_wait();
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    // Attempt to stop the container. Ignore any errors, then resume
+                    // waiting for the container to exit so we can get the exit code.
+                    let _ = self.docker.stop_container(&self.container_id, None).await;
+                    inner_wait_future.await
+                },
+                res = self.inner_wait() => { res }
+            }
+        };
+
+        self.cleanup().await?;
+
+        res
     }
 
-    pub async fn cleanup(&mut self) -> Result<()> {
-        if let Some(container_id) = self.container_id.take() {
-            self.docker.stop_container(&container_id, None).await?;
+    async fn inner_wait(&self) -> Result<i64> {
+        let status_code = self
+            .docker
+            .wait_container(&self.container_id, None::<WaitContainerOptions<String>>)
+            .try_collect::<Vec<_>>()
+            .await?
+            .first()
+            .ok_or_else(|| anyhow!("missing wait response from daemon",))?
+            .status_code;
 
-            self.docker.remove_container(&container_id, None).await?;
-        }
+        Ok(status_code)
+    }
 
-        if let Some(stream_task) = self.stream_task.take() {
-            stream_task.await?;
-        }
+    pub async fn cleanup(self) -> Result<()> {
+        let _ = self.docker.remove_container(&self.container_id, None).await;
+        self.stream_task.await?;
 
         Ok(())
     }

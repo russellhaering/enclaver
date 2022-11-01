@@ -4,7 +4,8 @@ use enclaver::{
     build::EnclaveArtifactBuilder, constants::MANIFEST_FILE_NAME, manifest::load_manifest,
     run_container::RunWrapper,
 };
-use log::{debug, error};
+use log::{debug};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 #[clap(author, version)]
@@ -121,24 +122,24 @@ async fn run(args: Cli) -> Result<()> {
                 )),
             }?;
 
-            let mut runner = RunWrapper::new()?;
-
             let shutdown_signal = enclaver::utils::register_shutdown_signal_handler().await?;
+            let ct = CancellationToken::new();
 
-            tokio::select! {
-                res = runner.run_enclaver_image(&image_name, port_forwards) => {
-                    debug!("enclave exited");
-                    match res {
-                        Ok(_) => debug!("enclave exited successfully"),
-                        Err(e) => error!("error running enclave: {e:#}"),
-                    }
-                }
-                _ = shutdown_signal => {
-                    debug!("signal received, cleaning up...");
-                }
-            }
+            // We need a clone of the token to be moved into the task below
+            let sct = ct.clone();
 
-            runner.cleanup().await?;
+            let _ = tokio::task::spawn(async move {
+                let _ = shutdown_signal.await;
+                debug!("signal received, shutting down");
+                sct.cancel();
+            });
+
+            let runner = RunWrapper::new()?;
+            let rh = runner.run_enclaver_image(&image_name, port_forwards).await?;
+
+            // TODO: In the future we could propagate the exit code of the container
+            let status = rh.wait(ct.clone()).await?;
+            debug!("container exited with status: {status}");
 
             Ok(())
         }
