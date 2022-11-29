@@ -4,6 +4,7 @@ use crate::constants::{
 use crate::images::{FileBuilder, FileSource, ImageManager, ImageRef, LayerBuilder};
 use crate::manifest::{load_manifest, Manifest};
 use crate::nitro_cli::{EIFInfo, KnownIssue};
+use crate::target_platform::TargetPlatform;
 use anyhow::{anyhow, Result};
 use bollard::container::{Config, LogOutput, LogsOptions, WaitContainerOptions};
 use bollard::models::{ContainerConfig, HostConfig, Mount, MountTypeEnum};
@@ -28,10 +29,11 @@ pub struct EnclaveArtifactBuilder {
     docker: Arc<Docker>,
     image_manager: ImageManager,
     pull_tags: bool,
+    target_platform: TargetPlatform,
 }
 
 impl EnclaveArtifactBuilder {
-    pub fn new(pull_tags: bool) -> Result<Self> {
+    pub fn new(pull_tags: bool, target_platform: TargetPlatform) -> Result<Self> {
         let docker_client = Arc::new(
             Docker::connect_with_local_defaults()
                 .map_err(|e| anyhow!("connecting to docker: {}", e))?,
@@ -41,6 +43,7 @@ impl EnclaveArtifactBuilder {
             pull_tags,
             docker: docker_client.clone(),
             image_manager: ImageManager::new_with_docker(docker_client)?,
+            target_platform,
         })
     }
 
@@ -376,9 +379,9 @@ impl EnclaveArtifactBuilder {
     // otherwise we should not overwrite that tag.
     async fn resolve_external_source_image(&self, image_name: &str) -> Result<ImageRef> {
         if self.pull_tags {
-            self.image_manager.pull_image(image_name).await
+            self.image_manager.pull_image(image_name, &self.target_platform).await
         } else {
-            self.image_manager.find_or_pull(image_name).await
+            self.image_manager.find_or_pull(image_name, &self.target_platform).await
         }
     }
 
@@ -388,8 +391,8 @@ impl EnclaveArtifactBuilder {
         default: &str,
     ) -> Result<ImageRef> {
         match name_override {
-            Some(image_name) => self.image_manager.find_or_pull(image_name).await,
-            None => self.image_manager.pull_image(default).await,
+            Some(image_name) => self.image_manager.find_or_pull(image_name, &self.target_platform).await,
+            None => self.image_manager.pull_image(default, &self.target_platform).await,
         }
     }
 

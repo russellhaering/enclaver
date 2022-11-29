@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use enclaver::{
     build::EnclaveArtifactBuilder, constants::MANIFEST_FILE_NAME, manifest::load_manifest,
     run_container::RunWrapper,
+    target_platform,
 };
 use log::{debug, error};
 use tokio::io::{stdout, AsyncWriteExt};
@@ -28,9 +29,12 @@ enum Commands {
         /// Only build the EIF file, do not package it into a self-executing image.
         eif_file: Option<String>,
 
-        #[clap(long = "--pull")]
+        #[clap(long = "pull")]
         /// Pull any Docker images this depends on bef
         force_pull: bool,
+
+        #[clap(long = "platform", arg_enum)]
+        platform: Option<TargetPlatform>,
     },
 
     #[clap(name = "run")]
@@ -65,6 +69,33 @@ enum Commands {
     },
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum TargetPlatform {
+    #[clap(name = "linux/amd64")]
+    AMD64,
+    #[clap(name = "linux/arm64")]
+    ARM64,
+}
+
+impl TargetPlatform {
+    #[cfg(target_arch = "x86_64")]
+    fn default() -> Self {
+        Self::AMD64
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn default() -> Self {
+        Self::ARM64
+    }
+
+    fn to_internal(&self) -> target_platform::TargetPlatform {
+        match self {
+            Self::AMD64 => target_platform::TargetPlatform::AMD64,
+            Self::ARM64 => target_platform::TargetPlatform::ARM64,
+        }
+    }
+}
+
 async fn run(args: Cli) -> Result<()> {
     match args.subcommand {
         // Build an OCI image based on a manifest file.
@@ -72,8 +103,10 @@ async fn run(args: Cli) -> Result<()> {
             manifest_file,
             eif_file: None,
             force_pull,
+            platform,
         } => {
-            let builder = EnclaveArtifactBuilder::new(force_pull)?;
+            let platform = platform.unwrap_or_else(TargetPlatform::default);
+            let builder = EnclaveArtifactBuilder::new(force_pull, platform.to_internal())?;
             let (eif_info, release_img, tag) = builder.build_release(&manifest_file).await?;
             let eif_info_bytes = serde_json::to_vec_pretty(&eif_info)?;
 
@@ -91,8 +124,10 @@ async fn run(args: Cli) -> Result<()> {
             manifest_file,
             eif_file: Some(eif_file),
             force_pull,
+            platform,
         } => {
-            let builder = EnclaveArtifactBuilder::new(force_pull)?;
+            let platform = platform.unwrap_or_else(TargetPlatform::default);
+            let builder = EnclaveArtifactBuilder::new(force_pull, platform.to_internal())?;
             let (eif_info, eif_path) = builder.build_eif_only(&manifest_file, &eif_file).await?;
             let eif_info_bytes = serde_json::to_vec_pretty(&eif_info)?;
 

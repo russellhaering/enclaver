@@ -1,6 +1,7 @@
+use crate::target_platform::TargetPlatform;
 use crate::utils::StringablePathExt;
 use anyhow::{anyhow, Context, Result};
-use bollard::image::{BuildImageOptions, CreateImageOptions, TagImageOptions};
+use bollard::image::{BuildImageOptions, CreateImageOptions, TagImageOptions, ListImagesOptions};
 use bollard::models::{BuildInfo, CreateImageInfo, ImageId};
 use bollard::Docker;
 use futures_util::stream::{StreamExt, TryStreamExt};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use tokio::fs::{create_dir, File};
 use tokio::io::{duplex, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_util::codec;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct ImageRef {
@@ -57,21 +59,28 @@ impl ImageManager {
     /// Resolves a name-like string to an ImageRef referencing a specific immutable image.
     pub async fn image(&self, name: &str) -> Result<ImageRef> {
         debug!("attempting to resolve image: {name}");
-        let img = self
-            .docker
-            .inspect_image(name)
-            .await
-            .with_context(|| format!("inspecting image {}", name))?;
 
-        match img.id {
-            Some(id) => Ok(ImageRef { id }),
-            None => Err(anyhow!("missing image ID in image_inspect result")),
-        }
+        let mut imgs = self.docker.list_images(Some(ListImagesOptions {
+            filters: HashMap::from_iter(vec![("reference".to_string(), vec![name.to_string()])]),
+            ..Default::default()
+        })).await
+        .with_context(|| format!("listing images with reference {}", name))?;
+
+        println!("imgs: {:#?}", imgs);
+
+        imgs.sort_by(|a, b| b.created.cmp(&a.created));
+
+        todo!();
+
+        //match img.id {
+        //    Some(id) => Ok(ImageRef { id }),
+        //    None => Err(anyhow!("missing image ID in image_inspect result")),
+        //}
     }
 
     /// Look for a local image with the specified name. If it exists, return it. Otherwise, attempt
     /// to pull the specified name from a remote registry.
-    pub async fn find_or_pull(&self, image_name: &str) -> Result<ImageRef> {
+    pub async fn find_or_pull(&self, image_name: &str, platform: &TargetPlatform) -> Result<ImageRef> {
         debug!("looking for image {image_name}");
         let img = match self.image(image_name).await {
             Ok(img) => Ok(Some(img)),
@@ -91,18 +100,19 @@ impl ImageManager {
             }
             None => {
                 debug!("local image not found, attempting to pull {image_name}");
-                self.pull_image(image_name).await
+                self.pull_image(image_name, platform).await
             }
         }
     }
 
     /// Pull an image from a remote registry, if it is not already present, while streaming
     /// output to the terminal.
-    pub async fn pull_image(&self, image_name: &str) -> Result<ImageRef> {
+    pub async fn pull_image(&self, image_name: &str, platform: &TargetPlatform) -> Result<ImageRef> {
         debug!("fetching image: {}", image_name);
         let mut fetch_stream = self.docker.create_image(
             Some(CreateImageOptions {
                 from_image: image_name,
+                platform: platform.to_str(),
                 ..Default::default()
             }),
             None,
